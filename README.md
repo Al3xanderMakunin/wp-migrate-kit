@@ -19,10 +19,8 @@ Bash CLI для переноса WordPress на Linux VPS с Docker Engine. Во
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y git python3 rsync util-linux coreutils
-git clone https://github.com/Al3xanderMakunin/wp-migrate-kit.git
-cd wp-migrate-kit
-bash wp-migrate --help
+sudo apt-get install -y curl python3 rsync util-linux coreutils
+curl -fsSL https://raw.githubusercontent.com/Al3xanderMakunin/wp-migrate-kit/main/dist/wp-migrate -o wp-migrate && bash wp-migrate --help
 ```
 
 CLI запускается от root на хосте локального Docker Engine. Он берёт путь к данным из `docker inspect`. Поддерживаются обычные локальные named volumes и bind mounts. Для удалённого Docker, rootless Docker, user namespace remapping, сетевых томов, вложенных монтирований внутри `wp-content` и Swarm нужен другой способ восстановления.
@@ -49,17 +47,26 @@ source_args=(
 )
 ```
 
-**Cloudflare R2 / S3.** Установите [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html), настройте профиль для root с доступом на чтение объектов и, для UpdraftPlus, листингом нужного префикса. Для R2 укажите регион `auto`. Храните ключи в настройках AWS на VPS. В префиксе набора держите архивы на одном уровне, без вложенных каталогов. Для AWS S3 опустите `--endpoint`.
+**Cloudflare R2 / S3.** Установите [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html). Для ключей нужен доступ на чтение объектов и, для UpdraftPlus, листинг нужного префикса. В префиксе набора держите архивы на одном уровне, без вложенных каталогов.
+
+С `--s3-prompt` команды `dry-run` и `apply` запросят Access Key ID, Secret Access Key и необязательный Session Token. Ввод скрыт. CLI передаёт ключи AWS CLI через окружение на время скачивания, затем продолжает выбранную операцию. Повторный запуск запрашивает ключи заново. Для стандартного адреса R2 регион `auto` выбирается автоматически. Для AWS S3 опустите `--endpoint` и при необходимости добавьте, например, `--region eu-west-1`.
 
 ```bash
-sudo aws configure --profile wp-r2
 source_args=(
   --s3 s3://YOUR_BUCKET/site/migration/
   --endpoint https://YOUR_ACCOUNT_ID.r2.cloudflarestorage.com
-  --profile wp-r2
+  --s3-prompt
   --set backup_2026-01-01-0000_site_123456789abc
 )
 # Для обычного бэкапа вместо --set укажите --files site.tar.gz --sql wordpress.sql.gz.
+```
+
+Для автоматизации настройте `sudo aws configure --profile wp-r2` и замените `--s3-prompt` на `--profile wp-r2`.
+
+Пример запуска `dry-run` одной строкой без клонирования. Подставьте имена контейнеров, путь к конфигурации клиента БД, адрес R2 и имя своего набора.
+
+```bash
+(script=$(mktemp) && trap 'rm -f -- "$script"' EXIT && curl -fsSL https://raw.githubusercontent.com/Al3xanderMakunin/wp-migrate-kit/main/dist/wp-migrate -o "$script" && sudo bash "$script" dry-run --wp wordpress --db mariadb --database wordpress --db-cnf /run/secrets/wp-migrate.cnf --prefix wp_ --s3 s3://YOUR_BUCKET/site/migration/ --endpoint https://YOUR_ACCOUNT_ID.r2.cloudflarestorage.com --s3-prompt --set backup_2026-01-01-0000_site_123456789abc)
 ```
 
 [Подключение AWS CLI к R2](https://developers.cloudflare.com/r2/examples/aws/aws-cli/).
@@ -126,9 +133,10 @@ sudo docker start wordpress
 
 ```bash
 bash -n wp-migrate && bash -n tests/integration.sh
+python3 tools/build-standalone.py --check
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 sudo bash tests/integration.sh
 sudo env TEST_MOUNT=bind bash tests/integration.sh
 ```
 
-Интеграционные тесты используют временные контейнеры MariaDB 11.4 и Alpine, отдельные тома и тестовые данные. GitHub Actions запускает их для named volume и bind mount. Загрузка из S3 проверяется с подставным AWS CLI и раздельными архивами UpdraftPlus. Проверка реальными данными сайта и вашим R2-профилем проводится через dry-run и тестовый перенос перед переключением трафика.
+Интеграционные тесты запускают самодостаточную сборку в Docker с временными контейнерами MariaDB 11.4 и Alpine. GitHub Actions проверяет named volume и bind mount. Загрузка из S3 проверяется с подставным AWS CLI, интерактивным вводом через псевдотерминал и раздельными архивами UpdraftPlus. Проверка с реальным бакетом проводится через dry-run перед переключением трафика.

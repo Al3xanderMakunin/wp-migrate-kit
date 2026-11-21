@@ -63,7 +63,7 @@ source=(--files "$scratch/files.tar.gz" --sql "$scratch/wordpress.sql")
 run() {
   local action=$1
   shift
-  bash "$root/wp-migrate" "$action" "${base[@]}" "$@"
+  bash "$root/dist/wp-migrate" "$action" "${base[@]}" "$@"
 }
 
 run preflight "${source[@]}"
@@ -110,8 +110,17 @@ PY
 cat > "$scratch/bin/aws" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-[[ $# == 15 && $1 == --endpoint-url && $2 == https://r2.example && $3 == --profile
-   && $4 == test-profile && $5 == s3 && $6 == cp && $7 == s3://test-bucket/site/
+[[ $# == 15 && $1 == --endpoint-url ]] || exit 2
+case $2 in
+  https://r2.example)
+    [[ $3 == --profile && $4 == test-profile ]] || exit 2 ;;
+  https://fixture.r2.cloudflarestorage.com)
+    [[ $3 == --region && $4 == auto && -z ${AWS_PROFILE-}
+       && ${AWS_ACCESS_KEY_ID-} == fixture-access && ${AWS_SECRET_ACCESS_KEY-} == fixture-secret
+       && ${AWS_SESSION_TOKEN-} == fixture-token && -z ${AWS_SECURITY_TOKEN-} ]] || exit 2 ;;
+  *) exit 2 ;;
+esac
+[[ $5 == s3 && $6 == cp && $7 == s3://test-bucket/site/
    && $9 == --recursive && ${10} == --no-follow-symlinks && ${11} == --exclude
    && ${12} == '*' && ${13} == --include && ${15} == --only-show-errors ]] || exit 2
 pattern=${14}
@@ -127,4 +136,13 @@ run dry-run "${remote[@]}"
 run apply "${remote[@]}" --yes
 [[ $(cat "$target/uploads/first.txt") == first.txt && $(cat "$target/uploads/second.txt") == second.txt ]]
 [[ $(db_query wordpress -e 'SELECT id FROM wp_posts') == 42 ]]
+run rollback --yes
+interactive=(--s3 s3://test-bucket/site/ --endpoint https://fixture.r2.cloudflarestorage.com --s3-prompt --set "$stem")
+AWS_PROFILE=ignored AWS_SECURITY_TOKEN=ignored python3 "$root/tests/s3-terminal.py" \
+  bash "$root/dist/wp-migrate" dry-run "${base[@]}" "${interactive[@]}"
+[[ ! -e $target/uploads && $(db_query wordpress -e 'SELECT id FROM original') == 7 ]]
+if setsid -w bash "$root/dist/wp-migrate" dry-run "${base[@]}" "${interactive[@]}" </dev/null; then
+  echo 'Interactive S3 succeeded without a terminal'
+  exit 1
+fi
 echo "Integration passed ($mount)"

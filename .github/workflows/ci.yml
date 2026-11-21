@@ -15,7 +15,8 @@ jobs:
         mount: [volume, bind]
     steps:
       - uses: actions/checkout@v4
-      - run: bash -n wp-migrate && bash -n tests/integration.sh
+      - run: python3 tools/build-standalone.py --check
+      - run: bash -n wp-migrate && bash -n dist/wp-migrate && bash -n tests/integration.sh
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
       - run: docker pull mariadb:11.4 && docker pull alpine:3.22
       - run: sudo env TEST_MOUNT=${{ matrix.mount }} bash tests/integration.sh
