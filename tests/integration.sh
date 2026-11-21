@@ -147,4 +147,14 @@ if setsid -w bash "$root/dist/wp-migrate" dry-run "${base[@]}" "${interactive[@]
   echo 'Interactive S3 succeeded without a terminal'
   exit 1
 fi
+
+wizard_answers=("$wp" "$db" /var/www/html/wp-content '' '' '' "$scratch/state" '' ''
+  2 /tmp/wp-fixture.cnf)
+export WIZARD_CLI="$root/dist/wp-migrate"
+printf '%s\n' 1 "${wizard_answers[@]}" 2 2 "$scratch/files.tar.gz" "$scratch/wordpress.sql" '' yes yes yes |
+  SHELL=/bin/bash script -qefc 'bash <(cat "$WIZARD_CLI")' /dev/null
+[[ $(db_query wordpress -e 'SELECT id FROM wp_posts') == 42 ]]
+[[ $(docker inspect --format '{{.State.Running}}' "$wp") == true ]]
+printf '%s\n' 2 "${wizard_answers[@]}" yes yes no | script -qefc 'bash "$WIZARD_CLI"' /dev/null
+[[ ! -e $target/uploads && $(db_query wordpress -e 'SELECT id FROM original') == 7 ]]
 echo "Integration passed ($mount)"
