@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+export LC_ALL=C
+
+die() { printf 'wp-migrate: %s\n' "$*" >&2; exit 1; }
+log() { printf '%s\n' "$*" >&2; }
+usage() {
+  cat <<'EOF'
+wp-migrate {preflight|dry-run|apply|rollback} --wp CONTAINER --db CONTAINER
+  --database NAME --db-cnf /path/in/db/container.cnf --prefix wp_
+  [--mount /var/www/html] [--content /var/www/html/wp-content]
+  [--state /var/lib/wp-migrate-kit] [--uid 33 --gid 33]
+  [--updraft DIR --set BACKUP_STEM | --files ARCHIVE --sql DUMP]
+  [--s3 s3://BUCKET/PREFIX/ [--endpoint https://HOST] [--profile PROFILE]]
+  [--max-gib 50] [--yes]
+EOF
+}
+
+[[ $# -gt 0 ]] || { usage; exit 2; }
+action=$1
+shift
+case "$action" in
+  -h|--help) usage; exit 0 ;;
+  preflight|dry-run|apply|rollback) ;;
+  *) die 'Unknown command' ;;
+esac
+wp= db= database= db_cnf= prefix= updraft= set= files= sql= s3= endpoint= profile=
+mount=/var/www/html content=/var/www/html/wp-content state=/var/lib/wp-migrate-kit
+uid=33 gid=33 max_gib=50 yes=false
+while (($#)); do
+  case "$1" in
+    --yes) yes=true; shift; continue ;;
+    --wp|--db|--database|--db-cnf|--prefix|--mount|--content|--state|--uid|--gid|--updraft|--set|--files|--sql|--s3|--endpoint|--profile|--max-gib)
+      (($# >= 2)) && [[ -n $2 && $2 != --* ]] || die "Missing value for $1"
+      option=$1
+      option=${option#--}
+      printf -v "${option//-/_}" '%s' "$2"
+      shift 2 ;;
+    *) die "Unknown option: $1" ;;
+  esac
+done
+
+[[ $(uname -s) == Linux && $EUID == 0 ]] || die 'Run as root on the Linux Docker host'
+[[ $wp =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ && $db =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ && $wp != "$db" ]] || die 'Specify distinct WordPress and DB containers'
+[[ $database =~ ^[a-zA-Z0-9_]{1,64}$ && $prefix =~ ^[a-zA-Z0-9_]{1,40}$ ]] || die 'Invalid database name or table prefix'
+case "${database,,}" in mysql|sys|performance_schema|information_schema) die 'System database forbidden';; esac
+[[ $db_cnf =~ ^/[a-zA-Z0-9_./-]+$ && $state == /* ]] || die 'Specify absolute DB option file and state paths'
+[[ $uid =~ ^[0-9]{1,9}$ && $gid =~ ^[0-9]{1,9}$ && $max_gib =~ ^[1-9][0-9]{0,2}$ ]] || die 'Invalid UID, GID or size limit'
+if [[ $action == apply || $action == rollback ]]; then
+  $yes || die 'Review dry-run and pass --yes for a write operation'
+fi
+if [[ $action != rollback ]]; then
+  if [[ -n $set ]]; then
+    [[ -z $files && -z $sql && ( -n $updraft || -n $s3 ) ]] || die 'Choose one backup format'
+  else
+    [[ -z $updraft && -n $files && -n $sql ]] || die 'Specify --set or both --files and --sql'
+  fi
+  if [[ -n $s3 ]]; then
+    [[ -z $updraft && $s3 =~ ^s3://[a-zA-Z0-9.-]+/[^[:space:]]+/$ ]] || die 'Use a dedicated S3 prefix with a trailing slash'
+    [[ -z $endpoint || $endpoint =~ ^https://[a-zA-Z0-9.-]+(:[0-9]+)?$ ]] || die 'Invalid HTTPS S3 endpoint'
+    command -v aws >/dev/null || die 'AWS CLI is required'
+  else
+    [[ -z $endpoint && -z $profile ]] || die 'S3 options require --s3'
+  fi
+fi
+for dep in docker python3 rsync flock realpath sha256sum sync stat install df; do
+  command -v "$dep" >/dev/null || die "Missing dependency: $dep"
+done
+unset DOCKER_HOST DOCKER_CONTEXT
+export DOCKER_HOST=unix:///var/run/docker.sock
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+helper=$script_dir/lib/backup.py
+[[ -r $helper ]] || die 'Clone or unpack the complete repository'
+temp=
+snapshot=
+armed=false
+db_id=
+target=
+query() {
+  docker exec -i "$db_id" "$client" "--defaults-file=$db_cnf" --protocol=socket --binary-mode --local-infile=0 --batch --skip-column-names "$@"
+}
+restore_snapshot() {
+  python3 "$helper" verify "$snapshot" || return 1
+  [[ $(resolve_target stopped) == "$target" ]] || return 1
+  query < "$snapshot/db.sql" || return 1
+  rsync -aHAX --numeric-ids --delete -- "$snapshot/content/" "$target/" || return 1
+  sync -f "$target" || return 1
+  mark rolled-back || return 1
+}
+cleanup() {
+  local status=$?
+  trap - EXIT
+  trap '' INT TERM
+  if ((status)) && $armed; then
+    log "Apply failed. Restoring snapshot $snapshot"
+    if restore_snapshot; then
+      log 'Automatic rollback completed. WordPress remains stopped.'
+    else
+      log 'Automatic rollback failed. Keep WordPress stopped and retry rollback.'
+    fi
+  fi
+  if [[ -n $temp ]]; then rm -rf -- "$temp"; fi
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+resolve_target() {
+  python3 "$helper" target "$wp" "$mount" "$content" "$1"
+}
+mode=any
+if [[ $action == apply || $action == rollback ]]; then mode=stopped; fi
+target=$(resolve_target "$mode")
+db_id=$(docker inspect --type container --format '{{if .State.Running}}{{.Id}}{{end}}' "$db")
+[[ -n $db_id ]] || die 'DB container must be running'
+state=$(realpath -m -- "$state")
+[[ $state != / && "$state/" != "$target/"* && "$target/" != "$state/"* ]] || die 'State and WordPress content must be separate'
+python3 "$helper" state-path "$state"
+client=$(docker exec "$db_id" sh -ec 'command -v mariadb || command -v mysql')
+dump=$(docker exec "$db_id" sh -ec 'command -v mariadb-dump || command -v mysqldump')
+[[ $(query "$database" -e 'SELECT DATABASE()') == "$database" ]] || die 'Database connection failed'
+log "WordPress content: $target"
+log "Database: $database in $db"
+df -h -- "$target"
+if [[ $action == preflight ]]; then
+  log 'Target and DB connection checked. Run dry-run to validate and stage the backup.'
+  exit 0
+fi
+
+mark() {
+  printf '%s\n' "$1" > "$snapshot/.status.tmp" &&
+    mv -f -- "$snapshot/.status.tmp" "$snapshot/status" &&
+    sync -f "$snapshot"
+}
+if [[ $action == apply || $action == rollback ]]; then
+  exec 8<"$target"
+  flock -n 8 || die 'Another migration is using this wp-content directory'
+  install -d -m 0700 -- "$state"
+  [[ $(stat -c '%u:%a' -- "$state") == 0:700 ]] || die 'State directory must be root-owned with mode 0700'
+  exec 9>"$state/lock"
+  flock -n 9 || die 'Another migration is using this state directory'
+  [[ $(resolve_target stopped) == "$target" ]] || die 'WordPress mount changed'
+  key=$(printf '%s\0' "$target" "$db_id" "$database" | sha256sum)
+  key=${key%% *}
+  slot=$state/$key
+  mkdir -p -- "$slot"
+  if [[ -e $slot/latest ]]; then
+    read -r latest < "$slot/latest"
+    [[ $latest =~ ^snap\.[a-zA-Z0-9]+$ ]] || die 'Invalid snapshot pointer'
+    snapshot=$slot/$latest
+    read -r status < "$snapshot/status"
+    case "$status" in pending|applied|rolled-back) ;; *) die 'Invalid snapshot status';; esac
+  else
+    status=none
+  fi
+  if [[ $action == rollback ]]; then
+    [[ $status != none ]] || die 'No snapshot for this target'
+    [[ $status != rolled-back ]] || { log 'Already rolled back'; exit 0; }
+    restore_snapshot || die 'Rollback incomplete. Keep WordPress stopped and retry.'
+    log "Rollback completed: $snapshot"
+    exit 0
+  fi
+  [[ $status != pending ]] || die 'Interrupted apply. Run rollback first.'
+  temp=$(mktemp -d -- "$slot/stage.XXXXXXXX")
+else
+  temp=$(mktemp -d)
+fi
+
+if [[ -n $s3 ]]; then
+  aws_args=()
+  [[ -z $endpoint ]] || aws_args+=(--endpoint-url "$endpoint")
+  [[ -z $profile ]] || aws_args+=(--profile "$profile")
+  mkdir -- "$temp/download"
+  if [[ -n $set ]]; then
+    [[ $set =~ ^backup_[a-zA-Z0-9_.-]+$ ]] || die 'Invalid UpdraftPlus backup stem'
+    aws "${aws_args[@]}" s3 cp "$s3" "$temp/download" --recursive \
+      --no-follow-symlinks --exclude '*' --include "$set-*" --only-show-errors
+    updraft=$temp/download
+  else
+    [[ $files =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ && $sql =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ && $files != "$sql" ]] || die 'For S3 use distinct filenames relative to the prefix'
+    aws "${aws_args[@]}" s3 cp "$s3$files" "$temp/download/$files" --only-show-errors
+    aws "${aws_args[@]}" s3 cp "$s3$sql" "$temp/download/$sql" --only-show-errors
+    files=$temp/download/$files
+    sql=$temp/download/$sql
+  fi
+fi
+fingerprint=$(python3 "$helper" stage "$temp" "$max_gib" "$prefix" "$updraft" "$set" "$files" "$sql")
+fingerprint=$(printf '%s\0' "$fingerprint" "$uid" "$gid" "$prefix" | sha256sum)
+fingerprint=${fingerprint%% *}
+if [[ $action == dry-run ]]; then
+  log "Backup staged successfully. Fingerprint: $fingerprint"
+  exit 0
+fi
+if [[ $status == applied && $(cat -- "$snapshot/fingerprint") == "$fingerprint" ]]; then
+  log 'This backup is already applied.'
+  exit 0
+fi
+[[ $(resolve_target stopped) == "$target" ]] || die 'WordPress mount changed'
+snapshot=$(mktemp -d -- "$slot/snap.XXXXXXXX")
+mkdir -- "$snapshot/content"
+rsync -aHAX --numeric-ids -- "$target/" "$snapshot/content/"
+dump_args=(--single-transaction --quick --hex-blob --no-tablespaces --triggers --routines --events --add-drop-database --databases)
+if [[ $dump == */mysqldump ]]; then dump_args+=(--set-gtid-purged=OFF); fi
+docker exec "$db_id" "$dump" "--defaults-file=$db_cnf" --protocol=socket "${dump_args[@]}" "$database" > "$snapshot/db.sql"
+[[ -s $snapshot/db.sql ]] || die 'Empty snapshot SQL'
+printf '%s\n' "$fingerprint" > "$snapshot/fingerprint"
+python3 "$helper" seal "$snapshot"
+mark pending
+printf '%s\n' "${snapshot##*/}" > "$slot/.latest.tmp"
+mv -f -- "$slot/.latest.tmp" "$slot/latest"
+sync -f "$slot"
+armed=true
+
+schema=$(query "$database" -e 'SELECT DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = DATABASE()')
+IFS=$'\t' read -r charset collation <<< "$schema"
+[[ $charset =~ ^[a-zA-Z0-9_]+$ && $collation =~ ^[a-zA-Z0-9_]+$ ]] || die 'Cannot determine database encoding'
+query -e "DROP DATABASE \`$database\`; CREATE DATABASE \`$database\` CHARACTER SET $charset COLLATE $collation;"
+query "$database" < "$temp/import.sql"
+count=$(query "$database" -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE' AND table_name IN ('$prefix""options','$prefix""posts','$prefix""users')")
+[[ $count == 3 ]] || die 'Missing WordPress core tables. Check the source table prefix.'
+rsync -rltpgo --checksum --chown="$uid:$gid" --chmod=D755,F644 -- "$temp/content/" "$target/"
+sync -f "$target"
+mark applied
+armed=false
+log "Apply completed. Snapshot: $snapshot"

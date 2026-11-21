@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+.env.*
+*.cnf
+*.sql
+*.gz
+*.zip
+*.tar
+*.crypt
