@@ -35,8 +35,10 @@ docker exec "$db" sh -ec '
 db_query() { docker exec -i "$db" mariadb --defaults-file=/tmp/wp-fixture.cnf -N "$@"; }
 ready=false
 for _ in {1..60}; do
-  if db_query -e 'SELECT 1' >/dev/null 2>&1 &&
-    docker exec "$db" sh -c 'test "$(cat /proc/1/comm)" = mariadbd'; then
+  # Initialization uses a temporary server. Wait for the entrypoint to exec
+  # the final server before testing whether its socket accepts SQL.
+  if docker exec "$db" sh -c 'test "$(cat /proc/1/comm)" = mariadbd' &&
+    db_query -e 'SELECT 1' >/dev/null 2>&1; then
     ready=true
     break
   fi
