@@ -21,6 +21,7 @@ EOF
 }
 
 run_cli() (
+exec </dev/null
 action=$1
 shift
 case "$action" in
