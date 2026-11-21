@@ -28,7 +28,7 @@ fi
 # These credentials are disposable test fixtures. No database port is published.
 docker run -d --name "$db" --network none --mount "type=volume,src=$db_volume,dst=/var/lib/mysql" \
   -e MARIADB_ROOT_PASSWORD=fixture-only -e MARIADB_DATABASE=wordpress mariadb:11.4 >/dev/null
-docker create --name "$wp" --network none --mount "$mount" alpine:3.22 true >/dev/null
+docker create --name "$wp" --network none --mount "$mount" alpine:3.22 sleep 120 >/dev/null
 docker exec "$db" sh -ec '
   umask 077
   printf "[client]\nuser=root\npassword=fixture-only\n" > /tmp/wp-fixture.cnf'
@@ -71,6 +71,9 @@ run dry-run "${source[@]}"
 [[ ! -e $scratch/state && ! -e $target/uploads ]]
 [[ $(db_query wordpress -e 'SELECT id FROM original') == 7 ]]
 if run apply "${source[@]}"; then echo 'Apply succeeded without --yes'; exit 1; fi
+docker start "$wp" >/dev/null
+if run apply "${source[@]}" --yes; then echo 'Apply succeeded with WordPress running'; exit 1; fi
+docker stop -t 1 "$wp" >/dev/null
 if run apply --files "$scratch/files.tar.gz" --sql "$scratch/broken.sql" --yes; then
   echo 'Broken SQL unexpectedly succeeded'
   exit 1
@@ -86,4 +89,42 @@ run rollback --yes
 run rollback --yes
 [[ ! -e $target/uploads && $(cat "$target/original.txt") == original ]]
 [[ $(db_query wordpress -e 'SELECT id FROM original') == 7 ]]
+
+# Exercise the S3 branch and full UpdraftPlus restore with an AWS CLI test double.
+export FIXTURE_BUCKET="$scratch/bucket"
+stem=backup_2026-01-01-0000_fixture_123456789abc
+mkdir -p "$FIXTURE_BUCKET" "$scratch/bin"
+python3 - "$FIXTURE_BUCKET" "$stem" "$scratch/wordpress.sql" <<'PY'
+import gzip
+from pathlib import Path
+import sys
+import zipfile
+
+bucket, stem, sql = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3])
+with gzip.open(bucket / f"{stem}-db.gz", "wb") as stream:
+    stream.write(sql.read_bytes())
+for suffix, filename in (("uploads.zip", "first.txt"), ("uploads2.zip", "second.txt")):
+    with zipfile.ZipFile(bucket / f"{stem}-{suffix}", "w") as archive:
+        archive.writestr(f"uploads/{filename}", filename)
+PY
+cat > "$scratch/bin/aws" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $# == 15 && $1 == --endpoint-url && $2 == https://r2.example && $3 == --profile
+   && $4 == test-profile && $5 == s3 && $6 == cp && $7 == s3://test-bucket/site/
+   && $9 == --recursive && ${10} == --no-follow-symlinks && ${11} == --exclude
+   && ${12} == '*' && ${13} == --include && ${15} == --only-show-errors ]] || exit 2
+pattern=${14}
+for file in "$FIXTURE_BUCKET"/$pattern; do
+  cp -- "$file" "$8/"
+done
+SH
+chmod 700 "$scratch/bin/aws"
+export PATH="$scratch/bin:$PATH"
+remote=(--s3 s3://test-bucket/site/ --endpoint https://r2.example --profile test-profile --set "$stem")
+run dry-run "${remote[@]}"
+[[ ! -e $target/uploads && $(db_query wordpress -e 'SELECT id FROM original') == 7 ]]
+run apply "${remote[@]}" --yes
+[[ $(cat "$target/uploads/first.txt") == first.txt && $(cat "$target/uploads/second.txt") == second.txt ]]
+[[ $(db_query wordpress -e 'SELECT id FROM wp_posts') == 42 ]]
 echo "Integration passed ($mount)"
