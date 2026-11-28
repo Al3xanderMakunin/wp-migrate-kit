@@ -6,6 +6,23 @@ export LC_ALL=C
 
 die() { printf 'wp-migrate: %s\n' "$*" >&2; exit 1; }
 log() { printf '%s\n' "$*" >&2; }
+
+check_host_dependencies() {
+  local dep
+  local -a missing=()
+  for dep in docker python3 rsync flock realpath sha256sum sync stat install df \
+    cat mkdir mktemp mv rm "$@"; do
+    command -v "$dep" >/dev/null || missing+=("$dep")
+  done
+  if (("${#missing[@]}")); then
+    die "Missing required commands: ${missing[*]}. Install them before continuing."
+  fi
+  unset DOCKER_CONTEXT
+  export DOCKER_HOST=unix:///var/run/docker.sock
+  docker version --format '{{.Server.Version}}' >/dev/null ||
+    die 'Cannot reach the local Docker Engine. Start it and check access to /var/run/docker.sock before continuing.'
+}
+
 usage() {
   cat <<'EOF'
 wp-migrate                         # interactive wizard
@@ -72,11 +89,7 @@ if [[ $action != rollback ]]; then
     [[ -z $endpoint && -z $profile && -z $region ]] && ! $s3_prompt || die 'S3 options require --s3'
   fi
 fi
-for dep in docker python3 rsync flock realpath sha256sum sync stat install df; do
-  command -v "$dep" >/dev/null || die "Missing dependency: $dep"
-done
-unset DOCKER_HOST DOCKER_CONTEXT
-export DOCKER_HOST=unix:///var/run/docker.sock
+check_host_dependencies
 backup_helper() {
   python3 - "$@" <<'WP_MIGRATE_PYTHON'
 """Validate backups in private staging and resolve local Docker storage."""
@@ -414,8 +427,10 @@ db_id=$(docker inspect --type container --format '{{if .State.Running}}{{.Id}}{{
 state=$(realpath -m -- "$state")
 [[ $state != / && "$state/" != "$target/"* && "$target/" != "$state/"* ]] || die 'State and WordPress content must be separate'
 backup_helper state-path "$state"
-client=$(docker exec "$db_id" sh -ec 'command -v mariadb || command -v mysql')
-dump=$(docker exec "$db_id" sh -ec 'command -v mariadb-dump || command -v mysqldump')
+client=$(docker exec "$db_id" sh -ec 'command -v mariadb || command -v mysql') ||
+  die 'The DB container must provide mariadb or mysql'
+dump=$(docker exec "$db_id" sh -ec 'command -v mariadb-dump || command -v mysqldump') ||
+  die 'The DB container must provide mariadb-dump or mysqldump'
 [[ $(query "$database" -e 'SELECT DATABASE()') == "$database" ]] || die 'Database connection failed'
 log "WordPress content: $target"
 log "Database: $database in $db"
@@ -627,7 +642,6 @@ wizard_choose_container() (
 wizard_target() {
   local db_password containers
   local -a container_rows
-  command -v docker >/dev/null || { log 'Требуется Docker Engine'; return 1; }
   wizard_cleanup_cnf
   containers=$(docker ps -a --format '{{.Names}}\t{{.Image}}\t{{.Status}}') || return
   mapfile -t container_rows <<< "$containers"
@@ -690,6 +704,7 @@ wizard_source() {
   source_args=()
   case "$location" in
     1)
+      command -v aws >/dev/null || die 'Для Cloudflare R2/S3 требуется AWS CLI. Установите его перед продолжением.'
       ask 'Путь S3, включая префикс и завершающий / (s3://бакет/папка/)'
       source_args+=(--s3 "$answer" --s3-prompt)
       ask 'HTTPS endpoint для R2 или другого S3 (Enter для AWS S3)'
@@ -761,9 +776,8 @@ wizard_recover() {
 
 wizard() (
   [[ $(uname -s) == Linux && $EUID == 0 ]] || die 'Запустите мастер от root на Linux VPS'
+  check_host_dependencies stty
   if ! { exec </dev/tty; } 2>/dev/null; then die 'Для мастера нужен интерактивный терминал'; fi
-  unset DOCKER_CONTEXT
-  export DOCKER_HOST=unix:///var/run/docker.sock
 
   local stage=operation stage_status temp_cnf= db_id=
   trap wizard_cleanup_cnf EXIT
