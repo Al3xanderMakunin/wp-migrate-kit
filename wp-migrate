@@ -291,7 +291,7 @@ wizard_choose_container() {
   done
 
   while :; do
-    if ! read -r height width < <(stty size); then height=24 width=80; fi
+    if ! read -r height width < <(stty size <&3); then height=24 width=80; fi
     visible=$((height > 3 ? height - 3 : 1))
     if ((visible > ${#rows[@]})); then visible=${#rows[@]}; fi
     width=$((width > 3 ? width - 3 : 77))
@@ -311,7 +311,7 @@ wizard_choose_container() {
     done
     rendered=$((visible + 1))
 
-    IFS= read -rsn1 key || die 'Ввод прерван'
+    IFS= read -rsn1 -u 3 key || die 'Ввод прерван'
     case "$key" in
       ''|$'\r')
         answer=${rows[selected]%%$'\t'*}
@@ -319,14 +319,14 @@ wizard_choose_container() {
         return 0 ;;
       $'\004') die 'Ввод прерван' ;;
       $'\e')
-        if ! IFS= read -rsn2 -t 0.2 sequence; then continue; fi
+        if ! IFS= read -rsn2 -t 0.2 -u 3 sequence; then continue; fi
         case "$sequence" in
           '[A'|'OA') if ((selected > 0)); then selected=$((selected - 1)); fi ;;
           '[B'|'OB') if ((selected + 1 < ${#rows[@]})); then selected=$((selected + 1)); fi ;;
         esac ;;
     esac
   done
-} 3>/dev/tty
+} 3<>/dev/tty
 
 wizard_target() {
   local db_password containers

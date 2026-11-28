@@ -148,13 +148,33 @@ if setsid -w bash "$root/dist/wp-migrate" dry-run "${base[@]}" "${interactive[@]
   exit 1
 fi
 
-wizard_answers=("$wp" "$db" /var/www/html/wp-content '' '' '' "$scratch/state" '' ''
+wizard_answers=(/var/www/html/wp-content '' '' '' "$scratch/state" '' ''
   2 /tmp/wp-fixture.cnf)
+wizard_input() {
+  local operation=$1 container
+  local containers
+  shift
+  containers=$(docker ps -a --format '{{.Names}}')
+  printf '%s\n' "$operation"
+  # Move away from the first row and back to exercise both arrow keys.
+  printf '\033[B\033[A'
+  while IFS= read -r container; do
+    [[ $container != "$wp" ]] || break
+    printf '\033[B'
+  done <<< "$containers"
+  printf '\n'
+  while IFS= read -r container; do
+    [[ $container != "$db" ]] || break
+    if [[ $container != "$wp" ]]; then printf '\033[B'; fi
+  done <<< "$containers"
+  printf '\n'
+  printf '%s\n' "${wizard_answers[@]}" "$@"
+}
 export WIZARD_CLI="$root/dist/wp-migrate"
-printf '%s\n' 1 "${wizard_answers[@]}" 2 2 "$scratch/files.tar.gz" "$scratch/wordpress.sql" '' yes yes yes |
+wizard_input 1 2 2 "$scratch/files.tar.gz" "$scratch/wordpress.sql" '' yes yes yes |
   SHELL=/bin/bash script -qefc 'bash <(cat "$WIZARD_CLI")' /dev/null
 [[ $(db_query wordpress -e 'SELECT id FROM wp_posts') == 42 ]]
 [[ $(docker inspect --format '{{.State.Running}}' "$wp") == true ]]
-printf '%s\n' 2 "${wizard_answers[@]}" yes yes no | script -qefc 'bash "$WIZARD_CLI"' /dev/null
+wizard_input 2 yes yes no | script -qefc 'bash "$WIZARD_CLI"' /dev/null
 [[ ! -e $target/uploads && $(db_query wordpress -e 'SELECT id FROM original') == 7 ]]
 echo "Integration passed ($mount)"
