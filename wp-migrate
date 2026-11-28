@@ -284,7 +284,7 @@ wizard_cleanup_cnf() {
 }
 
 wizard_choose_container() (
-  local label=$1 excluded=$2 row key sequence name
+  local label=$1 excluded=$2 row key sequence name terminal_settings
   local selected=0 first=0 rendered=0 height width visible index
   local -a rows=()
   shift 2
@@ -292,6 +292,13 @@ wizard_choose_container() (
     name=${row%%$'\t'*}
     if [[ $name != "$excluded" ]]; then rows+=("$row"); fi
   done
+
+  terminal_settings=$(stty -g <&3) || return 1
+  trap 'stty "$terminal_settings" <&3' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  # Keep echo and line buffering off between key reads and redraws.
+  stty -echo -icanon min 1 time 0 <&3 || return 1
 
   while :; do
     if ! read -r height width < <(stty size <&3); then height=24 width=80; fi
@@ -314,16 +321,16 @@ wizard_choose_container() (
     done
     rendered=$((visible + 1))
 
-    IFS= read -rsn1 -u 3 key || die 'Ввод прерван'
+    IFS= read -rN1 -u 3 key || die 'Ввод прерван'
     case "$key" in
-      ''|$'\r')
+      $'\n'|$'\r')
         name=${rows[selected]%%$'\t'*}
         printf '\033[%dA\r\033[J%s: %s\n' "$rendered" "$label" "$name" >&3
         printf '%s\n' "$name"
         return 0 ;;
       $'\004') die 'Ввод прерван' ;;
       $'\e')
-        if ! IFS= read -rsn2 -t 0.2 -u 3 sequence; then continue; fi
+        if ! IFS= read -rN2 -t 0.2 -u 3 sequence; then continue; fi
         case "$sequence" in
           '[A'|'OA') if ((selected > 0)); then selected=$((selected - 1)); fi ;;
           '[B'|'OB') if ((selected + 1 < ${#rows[@]})); then selected=$((selected + 1)); fi ;;
