@@ -565,14 +565,65 @@ wizard_cleanup_cnf() {
   fi
 }
 
+wizard_choose_container() {
+  local label=$1 excluded=$2 row key sequence name
+  local selected=0 first=0 rendered=0 height width visible index
+  local -a rows=()
+  shift 2
+  for row in "$@"; do
+    name=${row%%$'\t'*}
+    if [[ $name != "$excluded" ]]; then rows+=("$row"); fi
+  done
+
+  while :; do
+    if ! read -r height width < <(stty size); then height=24 width=80; fi
+    visible=$((height > 3 ? height - 3 : 1))
+    if ((visible > ${#rows[@]})); then visible=${#rows[@]}; fi
+    width=$((width > 3 ? width - 3 : 77))
+    if ((selected < first)); then first=$selected; fi
+    if ((selected >= first + visible)); then first=$((selected - visible + 1)); fi
+    if ((first + visible > ${#rows[@]})); then first=$((${#rows[@]} - visible)); fi
+
+    if ((rendered)); then printf '\033[%dA\r\033[J' "$rendered" >&3; fi
+    printf '%s (↑/↓, Enter)\n' "$label" >&3
+    for ((index=first; index<first+visible; index++)); do
+      row=${rows[index]//$'\t'/ }
+      if ((index == selected)); then
+        printf '> %.*s\n' "$width" "$row" >&3
+      else
+        printf '  %.*s\n' "$width" "$row" >&3
+      fi
+    done
+    rendered=$((visible + 1))
+
+    IFS= read -rsn1 key || die 'Ввод прерван'
+    case "$key" in
+      ''|$'\r')
+        answer=${rows[selected]%%$'\t'*}
+        printf '\033[%dA\r\033[J%s: %s\n' "$rendered" "$label" "$answer" >&3
+        return 0 ;;
+      $'\004') die 'Ввод прерван' ;;
+      $'\e')
+        if ! IFS= read -rsn2 -t 0.2 sequence; then continue; fi
+        case "$sequence" in
+          '[A'|'OA') if ((selected > 0)); then selected=$((selected - 1)); fi ;;
+          '[B'|'OB') if ((selected + 1 < ${#rows[@]})); then selected=$((selected + 1)); fi ;;
+        esac ;;
+    esac
+  done
+} 3>/dev/tty
+
 wizard_target() {
-  local db_password
+  local db_password containers
+  local -a container_rows
   command -v docker >/dev/null || { log 'Требуется Docker Engine'; return 1; }
   wizard_cleanup_cnf
-  docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' || return
-  ask 'Имя контейнера WordPress'
+  containers=$(docker ps -a --format '{{.Names}}\t{{.Image}}\t{{.Status}}') || return
+  mapfile -t container_rows <<< "$containers"
+  (("${#container_rows[@]}" >= 2)) || { log 'Нужны два контейнера: WordPress и MariaDB/MySQL'; return 1; }
+  wizard_choose_container 'Контейнер WordPress' '' "${container_rows[@]}" || return
   wp_name=$answer
-  ask 'Имя контейнера MariaDB/MySQL'
+  wizard_choose_container 'Контейнер MariaDB/MySQL' "$wp_name" "${container_rows[@]}" || return
   db_name=$answer
   [[ $wp_name =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ && $db_name =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] ||
     { log 'Укажите имена контейнеров из списка'; return 1; }
