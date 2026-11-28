@@ -7,15 +7,52 @@ export LC_ALL=C
 die() { printf 'wp-migrate: %s\n' "$*" >&2; exit 1; }
 log() { printf '%s\n' "$*" >&2; }
 
+install_dependencies() {
+  local dep package
+  local -a packages=()
+  local -A listed=()
+  command -v apt-get >/dev/null ||
+    die "Отсутствуют команды: $*. Установите их через пакетный менеджер вашей системы."
+  for dep in "$@"; do
+    case "$dep" in
+      docker) package=docker.io ;;
+      aws) package=awscli ;;
+      flock) package=util-linux ;;
+      python3|rsync) package=$dep ;;
+      *) package=coreutils ;;
+    esac
+    if [[ -z ${listed[$package]-} ]]; then
+      packages+=("$package")
+      listed[$package]=1
+    fi
+  done
+
+  log "Отсутствуют команды: $*"
+  log "APT установит пакеты: ${packages[*]}"
+  ask 'Установить пакеты? Введите yes для подтверждения' no
+  [[ $answer == yes ]] || die 'Установка отменена. Для продолжения нужны указанные команды.'
+  apt-get update </dev/null && apt-get install -y "${packages[@]}" </dev/null ||
+    die 'APT не смог установить зависимости. Проверьте вывод APT.'
+  hash -r
+  for dep in "$@"; do
+    command -v "$dep" >/dev/null || die "После установки команда $dep недоступна."
+  done
+}
+
 check_host_dependencies() {
-  local dep
+  local mode=$1 dep
   local -a missing=()
+  shift
   for dep in docker python3 rsync flock realpath sha256sum sync stat install df \
     cat mkdir mktemp mv rm "$@"; do
     command -v "$dep" >/dev/null || missing+=("$dep")
   done
   if (("${#missing[@]}")); then
-    die "Missing required commands: ${missing[*]}. Install them before continuing."
+    if [[ $mode == interactive ]]; then
+      install_dependencies "${missing[@]}"
+    else
+      die "Missing required commands: ${missing[*]}. Install them before continuing."
+    fi
   fi
   unset DOCKER_CONTEXT
   export DOCKER_HOST=unix:///var/run/docker.sock
@@ -89,7 +126,7 @@ if [[ $action != rollback ]]; then
     [[ -z $endpoint && -z $profile && -z $region ]] && ! $s3_prompt || die 'S3 options require --s3'
   fi
 fi
-check_host_dependencies
+check_host_dependencies cli
 backup_helper() {
   python3 - "$@" <<'WP_MIGRATE_PYTHON'
 """Validate backups in private staging and resolve local Docker storage."""
@@ -704,7 +741,7 @@ wizard_source() {
   source_args=()
   case "$location" in
     1)
-      command -v aws >/dev/null || die 'Для Cloudflare R2/S3 требуется AWS CLI. Установите его перед продолжением.'
+      command -v aws >/dev/null || install_dependencies aws
       ask 'Путь S3, включая префикс и завершающий / (s3://бакет/папка/)'
       source_args+=(--s3 "$answer" --s3-prompt)
       ask 'HTTPS endpoint для R2 или другого S3 (Enter для AWS S3)'
@@ -776,8 +813,8 @@ wizard_recover() {
 
 wizard() (
   [[ $(uname -s) == Linux && $EUID == 0 ]] || die 'Запустите мастер от root на Linux VPS'
-  check_host_dependencies stty
   if ! { exec </dev/tty; } 2>/dev/null; then die 'Для мастера нужен интерактивный терминал'; fi
+  check_host_dependencies interactive stty
 
   local stage=operation stage_status temp_cnf= db_id=
   trap wizard_cleanup_cnf EXIT
