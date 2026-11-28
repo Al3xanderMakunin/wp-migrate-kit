@@ -158,10 +158,13 @@ if [[ $action == apply || $action == rollback ]]; then
   slot=$state/$key
   mkdir -p -- "$slot"
   if [[ -e $slot/latest ]]; then
-    read -r latest < "$slot/latest"
-    [[ $latest =~ ^snap\.[a-zA-Z0-9]+$ ]] || die 'Invalid snapshot pointer'
+    mapfile -t -n 1 snapshot_state < "$slot/latest"
+    latest=${snapshot_state[0]-}
+    [[ $latest =~ ^snap\.[a-zA-Z0-9]+$ ]] ||
+      die "Invalid snapshot pointer in $slot/latest: $(printf '%q' "$latest")"
     snapshot=$slot/$latest
-    read -r status < "$snapshot/status"
+    mapfile -t -n 1 snapshot_state < "$snapshot/status"
+    status=${snapshot_state[0]-}
     case "$status" in pending|applied|rolled-back) ;; *) die 'Invalid snapshot status';; esac
   else
     status=none
