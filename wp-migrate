@@ -20,6 +20,7 @@ EOF
 }
 
 run_cli() (
+set -e
 exec </dev/null
 action=$1
 shift
@@ -271,31 +272,29 @@ ask() {
   answer=${answer:-$default}
 }
 
-wizard() (
-  [[ $(uname -s) == Linux && $EUID == 0 ]] || die 'Запустите мастер от root на Linux VPS'
-  if ! { exec </dev/tty; } 2>/dev/null; then die 'Для мастера нужен интерактивный терминал'; fi
-  unset DOCKER_CONTEXT
-  export DOCKER_HOST=unix:///var/run/docker.sock
-  command -v docker >/dev/null || die 'Требуется Docker Engine'
+wizard_cleanup_cnf() {
+  if [[ -n $temp_cnf ]]; then
+    docker exec "$db_id" rm -f -- "$temp_cnf" ||
+      log "Удалите временный файл БД в контейнере: $temp_cnf"
+    temp_cnf=
+  fi
+}
 
-  ask 'Действие (1 — миграция, 2 — откат, 0 — выход)' 1
-  operation=$answer
-  case "$operation" in
-    1|2) ;;
-    0) exit 0 ;;
-    *) die 'Выберите 1, 2 или 0' ;;
-  esac
-  docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
+wizard_target() {
+  local db_password
+  command -v docker >/dev/null || { log 'Требуется Docker Engine'; return 1; }
+  wizard_cleanup_cnf
+  docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' || return
   ask 'Имя контейнера WordPress'
   wp_name=$answer
   ask 'Имя контейнера MariaDB/MySQL'
   db_name=$answer
   [[ $wp_name =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ && $db_name =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] ||
-    die 'Укажите имена контейнеров из списка'
-  wp_id=$(docker inspect --type container --format '{{.Id}}' "$wp_name")
-  db_id=$(docker inspect --type container --format '{{.Id}}' "$db_name")
-  [[ $wp_id != "$db_id" ]] || die 'Укажите два разных контейнера'
-  docker inspect --format '{{range .Mounts}}{{println .Destination .Type .Name}}{{end}}' "$wp_id"
+    { log 'Укажите имена контейнеров из списка'; return 1; }
+  wp_id=$(docker inspect --type container --format '{{.Id}}' "$wp_name") || return
+  db_id=$(docker inspect --type container --format '{{.Id}}' "$db_name") || return
+  [[ $wp_id != "$db_id" ]] || { log 'Укажите два разных контейнера'; return 1; }
+  docker inspect --format '{{range .Mounts}}{{println .Destination .Type .Name}}{{end}}' "$wp_id" || return
   ask 'Точка монтирования в WordPress' /var/www/html
   wp_mount=$answer
   ask 'Путь к wp-content в контейнере' /var/www/html/wp-content
@@ -311,98 +310,182 @@ wizard() (
   ask 'GID владельца файлов' 33
   owner_gid=$answer
   ask 'Авторизация БД (1 — ввести логин и пароль, 2 — использовать файл .cnf)' 1
-  temp_cnf=
   case "$answer" in
     1)
       ask 'Имя пользователя БД'
       db_user=$answer
-      [[ $db_user =~ ^[a-zA-Z0-9_.@-]+$ ]] || die 'Недопустимое имя пользователя БД'
-      [[ $(docker inspect --format '{{.State.Running}}' "$db_id") == true ]] || die 'Контейнер БД должен работать'
+      [[ $db_user =~ ^[a-zA-Z0-9_.@-]+$ ]] || { log 'Недопустимое имя пользователя БД'; return 1; }
+      [[ $(docker inspect --format '{{.State.Running}}' "$db_id") == true ]] || { log 'Контейнер БД должен работать'; return 1; }
       set +x
       IFS= read -rs -p 'Пароль пользователя БД: ' db_password || die 'Ввод прерван'
       printf '\n' >&2
-      [[ $db_password != *$'\r'* ]] || die 'Недопустимый символ в пароле'
+      [[ $db_password != *$'\r'* ]] || { log 'Недопустимый символ в пароле'; return 1; }
       db_password=${db_password//\\/\\\\}
       db_password=${db_password//\"/\\\"}
       temp_cnf=$(printf '[client]\nuser="%s"\npassword="%s"\n' "$db_user" "$db_password" |
         docker exec -i "$db_id" sh -ec '
           umask 077
           file=$(mktemp /tmp/wp-migrate.XXXXXXXX)
-          if cat >"$file"; then printf "%s\n" "$file"; else rm -f -- "$file"; exit 1; fi')
+          if cat >"$file"; then printf "%s\n" "$file"; else rm -f -- "$file"; exit 1; fi') || { unset db_password; return 1; }
       unset db_password
-      trap 'docker exec "$db_id" rm -f -- "$temp_cnf" || log "Удалите временный файл БД в контейнере: $temp_cnf"' EXIT
-      trap 'exit 130' INT
-      trap 'exit 143' TERM
       option_file=$temp_cnf ;;
     2)
       ask 'Путь к .cnf внутри контейнера БД' /run/secrets/wp-migrate.cnf
       option_file=$answer ;;
-    *) die 'Выберите 1 или 2' ;;
+    *) log 'Выберите 1 или 2'; return 1 ;;
   esac
   target_args=(--wp "$wp_id" --db "$db_id" --database "$database_name" --db-cnf "$option_file"
     --prefix "$table_prefix" --mount "$wp_mount" --content "$wp_content" --state "$state_path"
     --uid "$owner_uid" --gid "$owner_gid")
+}
 
-  if [[ $operation == 1 ]]; then
-    ask 'Откуда загрузить резервную копию (1 — Cloudflare R2/S3, 2 — файлы на VPS)' 1
-    location=$answer
-    source_args=()
-    case "$location" in
-      1)
-        ask 'Путь S3, включая префикс и завершающий / (s3://бакет/папка/)'
-        source_args+=(--s3 "$answer" --s3-prompt)
-        ask 'HTTPS endpoint для R2 или другого S3 (Enter для AWS S3)'
-        if [[ -n $answer ]]; then source_args+=(--endpoint "$answer"); fi
-        ask 'Регион S3 (Enter для региона по умолчанию)'
-        if [[ -n $answer ]]; then source_args+=(--region "$answer"); fi ;;
-      2) ;;
-      *) die 'Выберите 1 или 2' ;;
-    esac
-    ask 'Формат резервной копии (1 — UpdraftPlus, 2 — архив и SQL)' 1
-    case "$answer" in
-      1)
-        if [[ $location == 2 ]]; then
-          ask 'Каталог архивов UpdraftPlus на VPS'
-          source_args+=(--updraft "$answer")
-        fi
-        ask 'Имя набора UpdraftPlus без суффикса -db.gz или -uploads.zip'
-        source_args+=(--set "$answer") ;;
-      2)
-        ask 'Архив файлов (имя объекта S3 или путь на VPS)'
-        source_args+=(--files "$answer")
-        ask 'SQL-дамп (имя объекта S3 или путь на VPS)'
-        source_args+=(--sql "$answer") ;;
-      *) die 'Выберите 1 или 2' ;;
-    esac
-    ask 'Лимит распаковки в ГиБ' 50
-    source_args+=(--max-gib "$answer")
-    log 'Проверка цели и резервной копии'
-    run_cli preflight "${target_args[@]}" "${source_args[@]}"
-    run_cli dry-run "${target_args[@]}" "${source_args[@]}"
-    ask 'Восстановить данные? CLI остановит WordPress при необходимости. Введите yes для подтверждения' no
-  else
-    ask 'Откатить данные к последнему snapshot? CLI остановит WordPress при необходимости. Введите yes для подтверждения' no
-  fi
-  [[ $answer == yes ]] || { log 'Изменения отменены'; exit 0; }
+wizard_source() {
+  ask 'Откуда загрузить резервную копию (1 — Cloudflare R2/S3, 2 — файлы на VPS)' 1
+  location=$answer
+  source_args=()
+  case "$location" in
+    1)
+      ask 'Путь S3, включая префикс и завершающий / (s3://бакет/папка/)'
+      source_args+=(--s3 "$answer" --s3-prompt)
+      ask 'HTTPS endpoint для R2 или другого S3 (Enter для AWS S3)'
+      if [[ -n $answer ]]; then source_args+=(--endpoint "$answer"); fi
+      ask 'Регион S3 (Enter для региона по умолчанию)'
+      if [[ -n $answer ]]; then source_args+=(--region "$answer"); fi ;;
+    2) ;;
+    *) log 'Выберите 1 или 2'; return 1 ;;
+  esac
+  ask 'Формат резервной копии (1 — UpdraftPlus, 2 — архив и SQL)' 1
+  case "$answer" in
+    1)
+      if [[ $location == 2 ]]; then
+        ask 'Каталог архивов UpdraftPlus на VPS'
+        source_args+=(--updraft "$answer")
+      fi
+      ask 'Имя набора UpdraftPlus без суффикса -db.gz или -uploads.zip'
+      source_args+=(--set "$answer") ;;
+    2)
+      ask 'Архив файлов (имя объекта S3 или путь на VPS)'
+      source_args+=(--files "$answer")
+      ask 'SQL-дамп (имя объекта S3 или путь на VPS)'
+      source_args+=(--sql "$answer") ;;
+    *) log 'Выберите 1 или 2'; return 1 ;;
+  esac
+  ask 'Лимит распаковки в ГиБ' 50
+  source_args+=(--max-gib "$answer")
+}
 
-  ask 'Трафик закрыт, авторазвёртывание и фоновые задачи отключены? Введите yes для подтверждения' no
-  [[ $answer == yes ]] || { log 'Изменения отменены'; exit 0; }
-  if [[ $(docker inspect --format '{{.State.Running}}' "$wp_id") == true ]]; then
-    docker stop "$wp_id" >/dev/null
-  fi
+wizard_run_cli() {
+  # A conditional call would disable errexit inside run_cli, including during writes.
+  local status
+  set +e
+  run_cli "$@"
+  status=$?
+  set -e
+  case "$status" in
+    130|143) exit "$status" ;;
+  esac
+  stage_status=$status
+}
+
+wizard_write() {
+  local running
+  stage_status=1
+  running=$(docker inspect --format '{{.State.Running}}' "$wp_id") || return 0
+  if [[ $running == true ]]; then docker stop "$wp_id" >/dev/null || return 0; fi
   if [[ $operation == 1 ]]; then
     if [[ $location == 1 ]]; then log 'Для восстановления введите ключи S3 ещё раз'; fi
-    run_cli apply "${target_args[@]}" "${source_args[@]}" --yes
+    wizard_run_cli apply "${target_args[@]}" "${source_args[@]}" --yes
   else
-    run_cli rollback "${target_args[@]}" --yes
+    wizard_run_cli rollback "${target_args[@]}" --yes
   fi
-  ask 'Запустить WordPress сейчас? Введите yes для запуска' no
-  if [[ $answer == yes ]]; then
-    docker start "$wp_id" >/dev/null
-    log 'WordPress запущен. Проверьте сайт перед открытием трафика.'
-  else
-    log 'WordPress оставлен остановленным.'
-  fi
+}
+
+wizard_recover() {
+  local retry_stage=$1 retry_label=$2
+  log 'Этап завершился с ошибкой.'
+  while :; do
+    ask "Действие (1 — $retry_label, 2 — начать сначала, 0 — выход)" 1
+    case "$answer" in
+      1) stage=$retry_stage; return ;;
+      2) wizard_cleanup_cnf; stage=operation; return ;;
+      0) exit 1 ;;
+      *) log 'Выберите 1, 2 или 0' ;;
+    esac
+  done
+}
+
+wizard() (
+  [[ $(uname -s) == Linux && $EUID == 0 ]] || die 'Запустите мастер от root на Linux VPS'
+  if ! { exec </dev/tty; } 2>/dev/null; then die 'Для мастера нужен интерактивный терминал'; fi
+  unset DOCKER_CONTEXT
+  export DOCKER_HOST=unix:///var/run/docker.sock
+
+  local stage=operation stage_status temp_cnf= db_id=
+  trap wizard_cleanup_cnf EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  while :; do
+    case "$stage" in
+      operation)
+        ask 'Действие (1 — миграция, 2 — откат, 0 — выход)' 1
+        operation=$answer
+        case "$operation" in
+          1|2) stage=target ;;
+          0) exit 0 ;;
+          *) log 'Выберите 1, 2 или 0' ;;
+        esac ;;
+      target)
+        if wizard_target; then
+          if [[ $operation == 1 ]]; then stage=source; else stage=confirm; fi
+        else
+          wizard_recover target 'ввести параметры цели заново'
+        fi ;;
+      source)
+        if wizard_source; then
+          stage=preflight
+        else
+          wizard_recover source 'ввести параметры резервной копии заново'
+        fi ;;
+      preflight)
+        log 'Проверка цели и резервной копии'
+        wizard_run_cli preflight "${target_args[@]}" "${source_args[@]}"
+        if ((stage_status == 0)); then stage=dry_run; else
+          wizard_recover target 'ввести параметры миграции заново'
+        fi ;;
+      dry_run)
+        wizard_run_cli dry-run "${target_args[@]}" "${source_args[@]}"
+        if ((stage_status == 0)); then stage=confirm; else
+          wizard_recover source 'ввести параметры резервной копии заново'
+        fi ;;
+      confirm)
+        if [[ $operation == 1 ]]; then
+          ask 'Восстановить данные? CLI остановит WordPress при необходимости. Введите yes для подтверждения' no
+        else
+          ask 'Откатить данные к последнему snapshot? CLI остановит WordPress при необходимости. Введите yes для подтверждения' no
+        fi
+        [[ $answer == yes ]] || { log 'Изменения отменены'; exit 0; }
+        ask 'Трафик закрыт, авторазвёртывание и фоновые задачи отключены? Введите yes для подтверждения' no
+        [[ $answer == yes ]] || { log 'Изменения отменены'; exit 0; }
+        stage=write ;;
+      write)
+        wizard_write
+        if ((stage_status == 0)); then stage=start; else
+          wizard_recover target 'ввести параметры операции заново'
+        fi ;;
+      start)
+        ask 'Запустить WordPress сейчас? Введите yes для запуска' no
+        if [[ $answer != yes ]]; then
+          log 'WordPress оставлен остановленным.'
+          exit 0
+        fi
+        if docker start "$wp_id" >/dev/null; then
+          log 'WordPress запущен. Проверьте сайт перед открытием трафика.'
+          exit 0
+        fi
+        wizard_recover start 'повторить запуск WordPress' ;;
+    esac
+  done
 )
 
 if (($# == 0)); then
